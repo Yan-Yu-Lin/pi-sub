@@ -1,0 +1,672 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""pi-sub — a clean wrapper around `pi --mode json`, modeled on `cx` (the codex wrapper).
+
+Runs the pi coding agent (gpt-5.5) non-interactively, translating its noisy JSON
+event stream into:
+  - live denoised progress on STDERR (timestamps, tool calls, idle warnings)
+  - a clean final result on STDOUT (model/workdir header + answer + session id)
+
+So a human watching sees real-time progress, while a program capturing stdout
+gets only the clean answer + session id.
+
+Usage:
+  pi-sub [flags] PROMPT
+  pi-sub [flags] resume SESSION_ID PROMPT
+  pi-sub show SESSION_ID | --last
+  pi-sub --full [pi args...]            # raw passthrough to pi
+
+Wrapper flags:
+  --show-thinking, -T   Stream the model's reasoning live (default: hidden)
+  --show-tool-output    Print a short snippet of each tool's result
+  --quiet, -q           Only header/session/finish + final answer (no tool lines)
+  --no-progress         No stderr progress at all; just the final stdout
+  --prompt-file FILE    Read the prompt from a file (avoids shell-escaping issues)
+  --full                Raw passthrough to `pi` (no clean formatting)
+  --help, -h            This help
+
+Everything else is passed straight through to `pi` (e.g. --thinking high,
+--model, --append-system-prompt, --skill, --tools, ...).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+PI_CMD = ["pi"]
+SESSIONS_ROOT = Path.home() / ".pi" / "agent" / "sessions"
+PI_PKG_JSON = (
+    Path.home()
+    / ".npm-global/lib/node_modules/@earendil-works/pi-coding-agent/package.json"
+)
+WARNING_SECONDS = float(os.environ.get("PI_SUB_WARNING_SECONDS", "120"))
+
+# Wrapper-only flags (consumed here, never forwarded to pi).
+WRAPPER_NO_VALUE = {
+    "--show-thinking", "-T",
+    "--show-tool-output",
+    "--quiet", "-q",
+    "--no-progress",
+    "--full",
+}
+WRAPPER_WITH_VALUE = {"--prompt-file"}
+
+
+@dataclass
+class Options:
+    full_mode: bool = False
+    show_thinking: bool = False
+    show_tool_output: bool = False
+    quiet: bool = False
+    no_progress: bool = False
+    prompt_file: Path | None = None
+
+
+@dataclass
+class RunState:
+    session_id: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    provider: str | None = None
+    final_text: str = ""
+    cost_total: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    turn_completed: bool = False
+    error_message: str | None = None
+    # de-dupe accounting: count each assistant message's usage once
+    _counted_costs: set[int] = field(default_factory=set)
+
+
+def pi_version() -> str:
+    try:
+        return json.loads(PI_PKG_JSON.read_text()).get("version") or "pi"
+    except Exception:
+        return "pi"
+
+
+# --------------------------------------------------------------------------- #
+# Arg parsing
+# --------------------------------------------------------------------------- #
+def parse_args(argv: list[str]) -> tuple[Options, list[str]]:
+    opts = Options()
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            rest.extend(argv[i + 1:])
+            break
+        if a in ("--show-thinking", "-T"):
+            opts.show_thinking = True
+        elif a == "--show-tool-output":
+            opts.show_tool_output = True
+        elif a in ("--quiet", "-q"):
+            opts.quiet = True
+        elif a == "--no-progress":
+            opts.no_progress = True
+        elif a == "--full":
+            opts.full_mode = True
+        elif a == "--prompt-file":
+            if i + 1 >= len(argv):
+                raise ValueError("--prompt-file requires a file path")
+            opts.prompt_file = Path(argv[i + 1])
+            i += 1
+        elif a.startswith("--prompt-file="):
+            opts.prompt_file = Path(a.split("=", 1)[1])
+        else:
+            rest.append(a)
+        i += 1
+    return opts, rest
+
+
+# --------------------------------------------------------------------------- #
+# Progress reporter (stderr)
+# --------------------------------------------------------------------------- #
+class Progress:
+    def __init__(self, opts: Options) -> None:
+        self.opts = opts
+        self.enabled = not opts.no_progress
+        self.last_activity = time.monotonic()
+        self.warned = False
+        self.thinking_open = False
+        self.answer_open = False
+        self.emitted_model = False
+
+    def emit(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] pi-sub: {msg}\n")
+        sys.stderr.flush()
+
+    def raw(self, text: str) -> None:
+        if not self.enabled:
+            return
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+    def start(self) -> None:
+        self.emit(f"starting pi ({pi_version()})")
+
+    def on_session(self, state: RunState) -> None:
+        if state.session_id:
+            self.emit(f"session: {state.session_id}")
+        if state.cwd:
+            self.emit(f"workdir: {state.cwd}")
+
+    def maybe_model(self, state: RunState) -> None:
+        if self.emitted_model or not state.model:
+            return
+        prov = f" ({state.provider})" if state.provider else ""
+        self.emit(f"model: {state.model}{prov}")
+        self.emitted_model = True
+
+    def heartbeat(self) -> None:
+        if not self.enabled:
+            return
+        silent = time.monotonic() - self.last_activity
+        if silent < WARNING_SECONDS or self.warned:
+            return
+        self._close_inline()
+        self.emit(
+            f"warning: no events for {fmt_dur(silent)}; "
+            "pi may be on a long tool/subprocess or thinking hard"
+        )
+        self.warned = True
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
+        self.warned = False
+
+    # inline streaming (thinking / answer) -------------------------------- #
+    def _close_inline(self) -> None:
+        if self.thinking_open or self.answer_open:
+            self.raw("\n")
+            self.thinking_open = False
+            self.answer_open = False
+
+    def thinking_delta(self, delta: str) -> None:
+        if not self.opts.show_thinking or self.opts.quiet:
+            return
+        if not self.thinking_open:
+            self._close_inline()
+            self.raw(f"[{time.strftime('%H:%M:%S')}] pi-sub: \U0001f4ad ")
+            self.thinking_open = True
+        self.raw(delta)
+
+    def thinking_end(self) -> None:
+        if self.thinking_open:
+            self.raw("\n")
+            self.thinking_open = False
+
+    def tool_start(self, name: str, args: dict[str, Any]) -> None:
+        if self.opts.quiet:
+            return
+        self._close_inline()
+        self.emit(f"\U0001f527 {name}: {summarize_tool_args(name, args)}")
+
+    def tool_end(self, name: str, result: Any, is_error: bool) -> None:
+        if self.opts.quiet:
+            return
+        if is_error:
+            self.emit(f"   ↳ {name}: error")
+        if self.opts.show_tool_output and not is_error:
+            snippet = summarize_tool_result(result)
+            if snippet:
+                self.emit(f"   ↳ {snippet}")
+
+    def answer_marker(self) -> None:
+        if self.opts.quiet:
+            return
+        self._close_inline()
+        self.emit("\U0001f4ac writing answer…")
+
+    def finish(self, state: RunState, success: bool) -> None:
+        self._close_inline()
+        if success:
+            self.emit(
+                f"done · {state.tokens_in:,} in / {state.tokens_out:,} out "
+                f"· ${state.cost_total:.4f}"
+            )
+        else:
+            self.emit("finished with error")
+
+
+# --------------------------------------------------------------------------- #
+# Tool arg / result summarizers
+# --------------------------------------------------------------------------- #
+def summarize_tool_args(name: str, args: Any) -> str:
+    if not isinstance(args, dict):
+        return _truncate(str(args), 100)
+    n = name.lower()
+    if n == "bash" and "command" in args:
+        return _truncate(str(args["command"]).replace("\n", " "), 100)
+    for key in ("file_path", "filePath", "path", "file"):
+        if key in args:
+            extra = ""
+            if "pattern" in args:
+                extra = f"  pattern={args['pattern']!r}"
+            return f"{args[key]}{extra}"
+    for key in ("pattern", "query", "url"):
+        if key in args:
+            return _truncate(str(args[key]), 100)
+    return _truncate(json.dumps(args, ensure_ascii=False), 100)
+
+
+def summarize_tool_result(result: Any) -> str:
+    text = ""
+    if isinstance(result, dict):
+        content = result.get("content")
+        if isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+            text = " ".join(p for p in parts if p)
+        elif isinstance(content, str):
+            text = content
+    elif isinstance(result, str):
+        text = result
+    text = text.strip().replace("\n", " ")
+    return _truncate(text, 100) if text else ""
+
+
+def _truncate(s: str, n: int) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# --------------------------------------------------------------------------- #
+# Event handling
+# --------------------------------------------------------------------------- #
+def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            t = item.get("text")
+            if isinstance(t, str):
+                parts.append(t)
+    return "".join(parts)
+
+
+def handle_event(payload: dict[str, Any], state: RunState, progress: Progress) -> None:
+    et = payload.get("type")
+
+    if et == "session":
+        state.session_id = payload.get("id") or state.session_id
+        state.cwd = payload.get("cwd") or state.cwd
+        progress.on_session(state)
+        return
+
+    if et == "message_start" or et == "message_end":
+        msg = payload.get("message", {})
+        if msg.get("role") == "assistant":
+            state.model = msg.get("model") or state.model
+            state.provider = msg.get("provider") or state.provider
+            progress.maybe_model(state)
+        if et == "message_end" and msg.get("role") == "assistant":
+            # accumulate cost once per assistant message
+            ts = msg.get("timestamp")
+            usage = msg.get("usage") or {}
+            key = ts if isinstance(ts, int) else id(msg)
+            if key not in state._counted_costs:
+                state._counted_costs.add(key)
+                cost = usage.get("cost") or {}
+                state.cost_total += float(cost.get("total") or 0.0)
+                state.tokens_in += int(usage.get("input") or 0)
+                state.tokens_out += int(usage.get("output") or 0)
+            text = extract_text(msg.get("content"))
+            if text.strip():
+                state.final_text = text
+        return
+
+    if et == "message_update":
+        ev = payload.get("assistantMessageEvent") or {}
+        evt = ev.get("type")
+        if evt == "thinking_delta":
+            progress.thinking_delta(ev.get("delta", ""))
+        elif evt == "thinking_end":
+            progress.thinking_end()
+        elif evt == "text_start":
+            progress.answer_marker()
+        return
+
+    if et == "tool_execution_start":
+        progress.tool_start(payload.get("toolName", "tool"), payload.get("args") or {})
+        return
+
+    if et == "tool_execution_end":
+        progress.tool_end(
+            payload.get("toolName", "tool"),
+            payload.get("result"),
+            bool(payload.get("isError")),
+        )
+        return
+
+    if et == "turn_end":
+        msg = payload.get("message", {})
+        if msg.get("role") == "assistant":
+            text = extract_text(msg.get("content"))
+            if text.strip():
+                state.final_text = text
+        state.turn_completed = True
+        return
+
+    if et == "agent_end":
+        for msg in payload.get("messages", []) or []:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                text = extract_text(msg.get("content"))
+                if text.strip():
+                    state.final_text = text
+        return
+
+    if et == "auto_retry_start":
+        progress.emit(
+            f"retry {payload.get('attempt')}/{payload.get('maxAttempts')} "
+            f"after error: {_truncate(str(payload.get('errorMessage', '')), 80)}"
+        )
+        return
+
+    if et in ("compaction_start", "compaction_end"):
+        progress.emit(f"{et} ({payload.get('reason', '')})")
+        return
+
+
+# --------------------------------------------------------------------------- #
+# Clean run
+# --------------------------------------------------------------------------- #
+def run_clean(pi_args: list[str], opts: Options, stdin_text: str | None) -> int:
+    progress = Progress(opts)
+    progress.start()
+
+    cmd = [*PI_CMD, "--mode", "json", *pi_args]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        sys.stderr.write("pi-sub: `pi` not found on PATH\n")
+        return 127
+
+    out_q: queue.Queue[str] = queue.Queue()
+    err_lines: list[str] = []
+    err_q: queue.Queue[str] = queue.Queue()
+
+    t_out = threading.Thread(target=_pump, args=(proc.stdout, out_q), daemon=True)
+    t_err = threading.Thread(target=_pump, args=(proc.stderr, err_q), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    if stdin_text is not None and proc.stdin is not None:
+        threading.Thread(
+            target=_write_stdin, args=(proc.stdin, stdin_text), daemon=True
+        ).start()
+
+    state = RunState()
+    while (
+        proc.poll() is None
+        or t_out.is_alive()
+        or not out_q.empty()
+        or not err_q.empty()
+    ):
+        _drain(err_q, err_lines)
+        try:
+            line = out_q.get(timeout=1)
+        except queue.Empty:
+            progress.heartbeat()
+            continue
+        progress.touch()
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        handle_event(payload, state, progress)
+
+    rc = proc.wait()
+    t_out.join(timeout=1)
+    t_err.join(timeout=1)
+    _drain(err_q, err_lines)
+
+    success = state.turn_completed and rc == 0 and bool(state.final_text)
+    progress.finish(state, success)
+
+    if success:
+        emit_result(state)
+        return 0
+
+    err = state.error_message or first_error_line("".join(err_lines))
+    if not err and rc != 0:
+        err = f"pi exited with status {rc}"
+    if not err and not state.final_text:
+        err = "pi produced no final answer"
+    sys.stderr.write(f"pi-sub: {err or 'unknown error'}\n")
+    # still surface whatever partial answer we have
+    if state.final_text:
+        emit_result(state)
+    return rc or 1
+
+
+def emit_result(state: RunState) -> None:
+    out = sys.stdout
+    out.write(f"{pi_version()}\n--------\n")
+    if state.cwd:
+        out.write(f"workdir: {state.cwd}\n")
+    if state.model:
+        out.write(f"model: {state.model}\n")
+    if state.provider:
+        out.write(f"provider: {state.provider}\n")
+    out.write("--------\n\n")
+    if state.final_text:
+        out.write(state.final_text.rstrip() + "\n")
+    if state.session_id:
+        out.write(f"\nSession: {state.session_id}\n")
+    out.flush()
+
+
+def _pump(stream: Any, q: queue.Queue[str]) -> None:
+    if stream is None:
+        return
+    for line in stream:
+        q.put(line)
+
+
+def _write_stdin(stream: Any, text: str) -> None:
+    try:
+        stream.write(text)
+        if not text.endswith("\n"):
+            stream.write("\n")
+        stream.flush()
+    finally:
+        stream.close()
+
+
+def _drain(q: queue.Queue[str], sink: list[str]) -> None:
+    while True:
+        try:
+            sink.append(q.get_nowait())
+        except queue.Empty:
+            return
+
+
+def first_error_line(text: str) -> str | None:
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return None
+
+
+def fmt_dur(seconds: float) -> str:
+    total = int(seconds)
+    m, s = divmod(total, 60)
+    return f"{m}m {s}s" if m else f"{s}s"
+
+
+# --------------------------------------------------------------------------- #
+# show
+# --------------------------------------------------------------------------- #
+def iter_session_files() -> Iterable[Path]:
+    if not SESSIONS_ROOT.is_dir():
+        return []
+    return SESSIONS_ROOT.rglob("*.jsonl")
+
+
+def latest_session_file() -> Path | None:
+    files = list(iter_session_files())
+    if not files:
+        return None
+    return max(files, key=lambda p: (p.stat().st_mtime_ns, str(p)))
+
+
+def find_session_file(session_id: str) -> Path | None:
+    matches = [p for p in iter_session_files() if session_id in p.name]
+    if not matches:
+        return None
+    return max(matches, key=lambda p: (p.stat().st_mtime_ns, str(p)))
+
+
+def handle_show(args: list[str]) -> int:
+    use_last = False
+    sid: str | None = None
+    for a in args:
+        if a == "--last":
+            use_last = True
+        elif a in ("--help", "-h"):
+            sys.stdout.write("Usage:\n  pi-sub show SESSION_ID\n  pi-sub show --last\n")
+            return 0
+        elif a.startswith("-"):
+            sys.stderr.write(f"pi-sub show: unsupported flag: {a}\n")
+            return 2
+        elif sid is None:
+            sid = a
+        else:
+            sys.stderr.write("pi-sub show: expected one SESSION_ID or --last\n")
+            return 2
+
+    target = latest_session_file() if use_last else (find_session_file(sid) if sid else None)
+    if target is None:
+        sys.stderr.write(
+            f"pi-sub show: could not find {'most recent session' if use_last else f'session {sid}'}\n"
+        )
+        return 1
+
+    header_id = header_cwd = model = None
+    rows: list[tuple[str, str]] = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        et = entry.get("type")
+        if et == "session":
+            header_id = entry.get("id")
+            header_cwd = entry.get("cwd")
+        elif et == "model_change":
+            model = entry.get("modelId") or model
+        elif et == "message":
+            msg = entry.get("message", {})
+            role = msg.get("role")
+            if role == "assistant":
+                model = msg.get("model") or model
+            if role in ("user", "assistant"):
+                text = extract_text(msg.get("content"))
+                if text.strip() and not text.lstrip().startswith("<"):
+                    rows.append((role, text.strip()))
+
+    out = sys.stdout
+    if header_id:
+        out.write(f"Session: {header_id}\n")
+    if header_cwd:
+        out.write(f"CWD: {header_cwd}\n")
+    if model:
+        out.write(f"Model: {model}\n")
+    out.write(f"File: {target}\n")
+    for role, text in rows:
+        out.write(f"\n{'User' if role == 'user' else 'Assistant'}:\n{text}\n")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("--help", "-h"):
+        sys.stdout.write(__doc__ or "")
+        return 0
+
+    try:
+        opts, rest = parse_args(argv)
+    except ValueError as exc:
+        sys.stderr.write(f"pi-sub: {exc}\n")
+        return 2
+
+    # show: local-only, never contacts pi
+    if rest and rest[0] == "show":
+        return handle_show(rest[1:])
+
+    # build pi args + optional stdin prompt
+    stdin_text: str | None = None
+    if opts.prompt_file is not None:
+        try:
+            stdin_text = opts.prompt_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"pi-sub: {exc}\n")
+            return 2
+
+    pi_args = list(rest)
+
+    # resume SESSION_ID PROMPT  ->  --session SESSION_ID -p PROMPT
+    if pi_args and pi_args[0] == "resume":
+        pi_args = pi_args[1:]
+        if not pi_args:
+            sys.stderr.write('pi-sub: resume needs a SESSION_ID, e.g. pi-sub resume <id> "prompt"\n')
+            return 2
+        sid = pi_args[0]
+        tail = pi_args[1:]
+        pi_args = ["--session", sid, *tail]
+
+    if opts.full_mode:
+        completed = subprocess.run(
+            [*PI_CMD, *pi_args],
+            input=stdin_text,
+            text=stdin_text is not None,
+        )
+        return completed.returncode
+
+    # non-interactive: ensure -p / --print present
+    if not any(a in ("-p", "--print") for a in pi_args):
+        pi_args.append("-p")
+
+    # if prompt came from file, feed via stdin using pi's `-` convention
+    if stdin_text is not None and "-" not in pi_args:
+        pi_args.append("-")
+
+    return run_clean(pi_args, opts, stdin_text)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
