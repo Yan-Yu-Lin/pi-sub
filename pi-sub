@@ -6,11 +6,12 @@
 
 Runs the pi coding agent (gpt-5.5) non-interactively, translating its noisy JSON
 event stream into:
-  - live denoised progress on STDERR (timestamps, tool calls, idle warnings)
-  - a clean final result on STDOUT (model/workdir header + answer + session id)
+  - live denoised progress on STDERR (assistant text, tool calls, idle warnings)
+  - a clean transcript on STDOUT (model/workdir header + assistant messages +
+    summarized tool calls + session id)
 
 So a human watching sees real-time progress, while a program capturing stdout
-gets only the clean answer + session id.
+gets every visible assistant message instead of only the final answer.
 
 Usage:
   pi-sub [flags] PROMPT
@@ -21,8 +22,9 @@ Usage:
 Wrapper flags:
   --show-thinking, -T   Stream the model's reasoning live (default: hidden)
   --show-tool-output    Print a short snippet of each tool's result
-  --quiet, -q           Only header/session/finish + final answer (no tool lines)
-  --no-progress         No stderr progress at all; just the final stdout
+  --quiet, -q           Only header/session/finish on stderr; stdout unchanged
+  --no-progress         No stderr progress at all; just stdout
+  --final-only          Restore the old stdout format: only the final assistant answer
   --prompt-file FILE    Read the prompt from a file (avoids shell-escaping issues)
   --full                Raw passthrough to `pi` (no clean formatting)
   --help, -h            This help
@@ -58,6 +60,7 @@ WRAPPER_NO_VALUE = {
     "--show-tool-output",
     "--quiet", "-q",
     "--no-progress",
+    "--final-only",
     "--full",
 }
 WRAPPER_WITH_VALUE = {"--prompt-file"}
@@ -70,6 +73,7 @@ class Options:
     show_tool_output: bool = False
     quiet: bool = False
     no_progress: bool = False
+    final_only: bool = False
     prompt_file: Path | None = None
 
 
@@ -80,6 +84,7 @@ class RunState:
     model: str | None = None
     provider: str | None = None
     final_text: str = ""
+    transcript: list[tuple[str, str]] = field(default_factory=list)
     cost_total: float = 0.0
     tokens_in: int = 0
     tokens_out: int = 0
@@ -116,6 +121,8 @@ def parse_args(argv: list[str]) -> tuple[Options, list[str]]:
             opts.quiet = True
         elif a == "--no-progress":
             opts.no_progress = True
+        elif a == "--final-only":
+            opts.final_only = True
         elif a == "--full":
             opts.full_mode = True
         elif a == "--prompt-file":
@@ -226,11 +233,25 @@ class Progress:
             if snippet:
                 self.emit(f"   ↳ {snippet}")
 
-    def answer_marker(self) -> None:
+    def answer_start(self) -> None:
         if self.opts.quiet:
             return
-        self._close_inline()
-        self.emit("\U0001f4ac writing answer…")
+        if not self.answer_open:
+            self._close_inline()
+            self.raw(f"[{time.strftime('%H:%M:%S')}] pi-sub: \U0001f4ac ")
+            self.answer_open = True
+
+    def answer_delta(self, delta: str) -> None:
+        if self.opts.quiet:
+            return
+        if not self.answer_open:
+            self.answer_start()
+        self.raw(delta)
+
+    def answer_end(self) -> None:
+        if self.answer_open:
+            self.raw("\n")
+            self.answer_open = False
 
     def finish(self, state: RunState, success: bool) -> None:
         self._close_inline()
@@ -301,6 +322,12 @@ def extract_text(content: Any) -> str:
     return "".join(parts)
 
 
+def add_transcript(state: RunState, kind: str, text: str) -> None:
+    text = text.strip()
+    if text:
+        state.transcript.append((kind, text))
+
+
 def handle_event(payload: dict[str, Any], state: RunState, progress: Progress) -> None:
     et = payload.get("type")
 
@@ -330,6 +357,7 @@ def handle_event(payload: dict[str, Any], state: RunState, progress: Progress) -
             text = extract_text(msg.get("content"))
             if text.strip():
                 state.final_text = text
+                add_transcript(state, "Assistant", text)
         return
 
     if et == "message_update":
@@ -340,18 +368,30 @@ def handle_event(payload: dict[str, Any], state: RunState, progress: Progress) -
         elif evt == "thinking_end":
             progress.thinking_end()
         elif evt == "text_start":
-            progress.answer_marker()
+            progress.answer_start()
+        elif evt == "text_delta":
+            progress.answer_delta(ev.get("delta", ""))
+        elif evt == "text_end":
+            progress.answer_end()
         return
 
     if et == "tool_execution_start":
-        progress.tool_start(payload.get("toolName", "tool"), payload.get("args") or {})
+        tool_name = payload.get("toolName", "tool")
+        args = payload.get("args") or {}
+        summary = summarize_tool_args(tool_name, args)
+        add_transcript(state, "Tool", f"{tool_name}: {summary}")
+        progress.tool_start(tool_name, args)
         return
 
     if et == "tool_execution_end":
+        tool_name = payload.get("toolName", "tool")
+        is_error = bool(payload.get("isError"))
+        if is_error:
+            add_transcript(state, "Tool", f"{tool_name}: error")
         progress.tool_end(
-            payload.get("toolName", "tool"),
+            tool_name,
             payload.get("result"),
-            bool(payload.get("isError")),
+            is_error,
         )
         return
 
@@ -452,7 +492,7 @@ def run_clean(pi_args: list[str], opts: Options, stdin_text: str | None) -> int:
     progress.finish(state, success)
 
     if success:
-        emit_result(state)
+        emit_result(state, opts)
         return 0
 
     err = state.error_message or first_error_line("".join(err_lines))
@@ -463,11 +503,11 @@ def run_clean(pi_args: list[str], opts: Options, stdin_text: str | None) -> int:
     sys.stderr.write(f"pi-sub: {err or 'unknown error'}\n")
     # still surface whatever partial answer we have
     if state.final_text:
-        emit_result(state)
+        emit_result(state, opts)
     return rc or 1
 
 
-def emit_result(state: RunState) -> None:
+def emit_result(state: RunState, opts: Options) -> None:
     out = sys.stdout
     out.write(f"{pi_version()}\n--------\n")
     if state.cwd:
@@ -477,7 +517,14 @@ def emit_result(state: RunState) -> None:
     if state.provider:
         out.write(f"provider: {state.provider}\n")
     out.write("--------\n\n")
-    if state.final_text:
+    if opts.final_only:
+        if state.final_text:
+            out.write(state.final_text.rstrip() + "\n")
+    elif state.transcript:
+        out.write("Transcript:\n")
+        for kind, text in state.transcript:
+            out.write(f"\n{kind}:\n{text.rstrip()}\n")
+    elif state.final_text:
         out.write(state.final_text.rstrip() + "\n")
     if state.session_id:
         out.write(f"\nSession: {state.session_id}\n")
