@@ -22,6 +22,7 @@ Usage:
 Wrapper flags:
   --show-thinking, -T   Stream the model's reasoning live (default: hidden)
   --show-tool-output    Print a short snippet of each tool's result
+  --fast                Request Codex Fast/Priority through Arthur's Pi extension
   --quiet, -q           Only header/session/finish on stderr; stdout unchanged
   --no-progress         No stderr progress at all; just stdout
   --final-only          Restore the old stdout format: only the final assistant answer
@@ -30,7 +31,9 @@ Wrapper flags:
   --help, -h            This help
 
 Everything else is passed straight through to `pi` (e.g. --thinking high,
---model, --append-system-prompt, --skill, --tools, ...).
+--model, --append-system-prompt, --skill, --tools, ...). When Arthur's OpenAI
+Fast extension handles --fast, its eligibility/result notice is surfaced in
+the denoised progress stream.
 """
 
 from __future__ import annotations
@@ -74,6 +77,7 @@ class Options:
     quiet: bool = False
     no_progress: bool = False
     final_only: bool = False
+    fast_requested: bool = False
     prompt_file: Path | None = None
 
 
@@ -117,6 +121,11 @@ def parse_args(argv: list[str]) -> tuple[Options, list[str]]:
             opts.show_thinking = True
         elif a == "--show-tool-output":
             opts.show_tool_output = True
+        elif a == "--fast":
+            # Pi's first-pass parser treats unknown `--flag VALUE` as a string
+            # flag and would consume the prompt. Forward the boolean in equals
+            # form after wrapper-level resume rewriting instead.
+            opts.fast_requested = True
         elif a in ("--quiet", "-q"):
             opts.quiet = True
         elif a == "--no-progress":
@@ -257,8 +266,7 @@ class Progress:
         self._close_inline()
         if success:
             self.emit(
-                f"done · {state.tokens_in:,} in / {state.tokens_out:,} out "
-                f"· ${state.cost_total:.4f}"
+                f"done · {state.tokens_in:,} in / {state.tokens_out:,} out"
             )
         else:
             self.emit("finished with error")
@@ -467,7 +475,7 @@ def run_clean(pi_args: list[str], opts: Options, stdin_text: str | None) -> int:
         or not out_q.empty()
         or not err_q.empty()
     ):
-        _drain(err_q, err_lines)
+        _drain(err_q, err_lines, progress)
         try:
             line = out_q.get(timeout=1)
         except queue.Empty:
@@ -486,7 +494,7 @@ def run_clean(pi_args: list[str], opts: Options, stdin_text: str | None) -> int:
     rc = proc.wait()
     t_out.join(timeout=1)
     t_err.join(timeout=1)
-    _drain(err_q, err_lines)
+    _drain(err_q, err_lines, progress)
 
     success = state.turn_completed and rc == 0 and bool(state.final_text)
     progress.finish(state, success)
@@ -548,18 +556,30 @@ def _write_stdin(stream: Any, text: str) -> None:
         stream.close()
 
 
-def _drain(q: queue.Queue[str], sink: list[str]) -> None:
+def _drain(
+    q: queue.Queue[str],
+    sink: list[str],
+    progress: Progress | None = None,
+) -> None:
     while True:
         try:
-            sink.append(q.get_nowait())
+            line = q.get_nowait()
         except queue.Empty:
             return
+        sink.append(line)
+        stripped = line.strip()
+        if (
+            progress is not None
+            and not progress.opts.quiet
+            and stripped.startswith("pi-fast:")
+        ):
+            progress.emit(f"⚡ {stripped.removeprefix('pi-fast:').strip()}")
 
 
 def first_error_line(text: str) -> str | None:
     for line in text.splitlines():
         s = line.strip()
-        if s:
+        if s and not s.startswith("pi-fast:"):
             return s
     return None
 
@@ -695,6 +715,11 @@ def main(argv: list[str]) -> int:
         sid = pi_args[0]
         tail = pi_args[1:]
         pi_args = ["--session", sid, *tail]
+
+    if opts.fast_requested:
+        # Equals form prevents Pi's pre-extension parser from consuming the
+        # next positional argument as a value for the custom boolean flag.
+        pi_args.insert(0, "--fast=true")
 
     if opts.full_mode:
         completed = subprocess.run(
